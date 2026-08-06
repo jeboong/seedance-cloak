@@ -1,0 +1,7 @@
+# Seedance Cloak — 런타임 의존성
+PySide6>=6.6
+opencv-contrib-python>=4.9   # FaceDetectorYN(YuNet) 포함. opencv-python 과 중복 설치 지양
+numpy>=1.24
+
+# exe 빌드용(배포 시에만 필요)
+pyinstaller>=6.0

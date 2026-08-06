@@ -1,0 +1,389 @@
+"""재사용 커스텀 위젯 — 글래스 카드 / 토글 스위치 / 실수 슬라이더 / 색상 스와치 / 드롭영역 / 타이틀바."""
+
+from __future__ import annotations
+
+import os
+
+from PySide6.QtCore import (Property, QEasingCurve, QPoint, QPropertyAnimation,
+                            QRectF, QSize, Qt, Signal)
+from PySide6.QtGui import (QColor, QFont, QIcon, QLinearGradient, QPainter,
+                           QPainterPath, QPen)
+from PySide6.QtWidgets import (QAbstractButton, QColorDialog, QFrame,
+                               QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+                               QSlider, QVBoxLayout, QWidget)
+
+from app.ui import theme
+
+
+# ============================================================
+class GlassCard(QFrame):
+    """반투명 라운드 카드(글래스). 내부 세로 레이아웃 self.v 제공."""
+
+    def __init__(self, parent=None, radius: int = 16, pad: int = 16):
+        super().__init__(parent)
+        self._radius = radius
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.v = QVBoxLayout(self)
+        self.v.setContentsMargins(pad, pad, pad, pad)
+        self.v.setSpacing(10)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, self._radius, self._radius)
+        p.fillPath(path, QColor(255, 255, 255, 12))
+        p.setPen(QPen(QColor(255, 255, 255, 24), 1))
+        p.drawPath(path)
+
+
+class SectionHeader(QWidget):
+    def __init__(self, title: str, desc: str = "", parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        t = QLabel(title); t.setObjectName("SectionTitle")
+        lay.addWidget(t)
+        if desc:
+            d = QLabel(desc); d.setObjectName("SectionDesc"); d.setWordWrap(True)
+            lay.addWidget(d)
+
+
+def hline() -> QFrame:
+    line = QFrame()
+    line.setFixedHeight(1)
+    line.setStyleSheet(f"background: {theme.CARD_BORDER}; border: none;")
+    return line
+
+
+# ============================================================
+class ToggleSwitch(QAbstractButton):
+    """iOS 스타일 애니메이션 토글."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFixedSize(46, 26)
+        self.setCursor(Qt.PointingHandCursor)
+        self._offset = 0.0
+        self._anim = QPropertyAnimation(self, b"offset", self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.InOutCubic)
+        self.toggled.connect(self._animate)
+
+    def _animate(self, checked):
+        self._anim.stop()
+        self._anim.setStartValue(self._offset)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def get_offset(self):
+        return self._offset
+
+    def set_offset(self, v):
+        self._offset = v
+        self.update()
+
+    offset = Property(float, get_offset, set_offset)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        track_on = QColor(theme.ACCENT)
+        track_off = QColor(255, 255, 255, 34)
+        col = QColor(
+            int(track_off.red() + (track_on.red() - track_off.red()) * self._offset),
+            int(track_off.green() + (track_on.green() - track_off.green()) * self._offset),
+            int(track_off.blue() + (track_on.blue() - track_off.blue()) * self._offset),
+            int(track_off.alpha() + (255 - track_off.alpha()) * self._offset),
+        )
+        p.setBrush(col); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, w, h, h / 2, h / 2)
+        d = h - 6
+        x = 3 + (w - d - 6) * self._offset
+        # 노브: OFF=흰색, ON=어두움(흰 트랙 위 대비)
+        on = QColor(theme.ON_ACCENT)
+        knob = QColor(
+            int(255 + (on.red() - 255) * self._offset),
+            int(255 + (on.green() - 255) * self._offset),
+            int(255 + (on.blue() - 255) * self._offset),
+        )
+        p.setBrush(knob)
+        p.drawEllipse(QPoint(int(x + d / 2), int(h / 2)), int(d / 2), int(d / 2))
+
+
+class ToggleRow(QWidget):
+    """토글 + 제목/설명 한 줄."""
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, desc: str = "", checked: bool = False, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        text = QVBoxLayout(); text.setSpacing(2)
+        t = QLabel(title); t.setObjectName("SectionTitle")
+        text.addWidget(t)
+        if desc:
+            d = QLabel(desc); d.setObjectName("SectionDesc"); d.setWordWrap(True)
+            text.addWidget(d)
+        lay.addLayout(text, 1)
+        self.sw = ToggleSwitch()
+        self.sw.setChecked(checked)
+        self.sw.toggled.connect(self.toggled)
+        lay.addWidget(self.sw, 0, Qt.AlignTop)
+
+    def isChecked(self):
+        return self.sw.isChecked()
+
+    def setChecked(self, v):
+        self.sw.setChecked(v)
+
+
+# ============================================================
+class LabeledSlider(QWidget):
+    """라벨 + 값 + 슬라이더(실수 매핑)."""
+    changed = Signal(float)
+
+    def __init__(self, label: str, mn: float, mx: float, val: float,
+                 steps: int = 100, decimals: int = 2, suffix: str = "", parent=None):
+        super().__init__(parent)
+        self._mn, self._mx, self._steps = mn, mx, steps
+        self._dec, self._suffix = decimals, suffix
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        self._label = QLabel(label); self._label.setObjectName("Muted")
+        self._value = QLabel(); self._value.setObjectName("Value")
+        top.addWidget(self._label); top.addStretch(1); top.addWidget(self._value)
+        lay.addLayout(top)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, steps)
+        self.slider.setCursor(Qt.PointingHandCursor)
+        self.slider.valueChanged.connect(self._on_change)
+        self.slider.setStyleSheet(_slider_qss())
+        lay.addWidget(self.slider)
+        self.setValueF(val)
+
+    def _on_change(self, i):
+        v = self.valueF()
+        self._value.setText(f"{v:.{self._dec}f}{self._suffix}")
+        self.changed.emit(v)
+
+    def valueF(self) -> float:
+        return self._mn + (self._mx - self._mn) * self.slider.value() / self._steps
+
+    def setValueF(self, v: float):
+        v = max(self._mn, min(self._mx, v))
+        i = round((v - self._mn) / (self._mx - self._mn) * self._steps)
+        self.slider.setValue(int(i))
+        self._value.setText(f"{self.valueF():.{self._dec}f}{self._suffix}")
+
+
+def _slider_qss() -> str:
+    return f"""
+    QSlider::groove:horizontal {{
+        height: 6px; border-radius: 3px; background: rgba(255,255,255,0.10);
+    }}
+    QSlider::sub-page:horizontal {{
+        height: 6px; border-radius: 3px;
+        background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 {theme.ACCENT}, stop:1 {theme.ACCENT_HOVER});
+    }}
+    QSlider::handle:horizontal {{
+        width: 16px; height: 16px; margin: -6px 0; border-radius: 8px;
+        background: {theme.FG}; border: 2px solid {theme.BG};
+    }}
+    QSlider::handle:horizontal:hover {{ background: {theme.ACCENT_HOVER}; }}
+    """
+
+
+# ============================================================
+class ColorSwatch(QPushButton):
+    colorChanged = Signal(QColor)
+
+    def __init__(self, color: QColor, parent=None):
+        super().__init__(parent)
+        self._color = QColor(color)
+        self.setFixedSize(44, 28)
+        self.setCursor(Qt.PointingHandCursor)
+        self.clicked.connect(self._pick)
+
+    def color(self) -> QColor:
+        return QColor(self._color)
+
+    def bgr(self):
+        c = self._color
+        return (c.blue(), c.green(), c.red())
+
+    def _pick(self):
+        c = QColorDialog.getColor(self._color, self, "격자 색상 선택")
+        if c.isValid():
+            self._color = c
+            self.update()
+            self.colorChanged.emit(c)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.setBrush(self._color)
+        p.setPen(QPen(QColor(255, 255, 255, 60), 1))
+        p.drawRoundedRect(r, 8, 8)
+
+
+# ============================================================
+class DropArea(QFrame):
+    filesDropped = Signal(list)
+    EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv",
+            ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(150)
+        self._hover = False
+        self._filename = ""
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        self.icon = QLabel("⬍")
+        self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setStyleSheet("font-size: 30px; color: %s;" % theme.FG_MUTED)
+        self.text = QLabel("영상 또는 이미지를 드래그하거나 클릭해서 선택 (여러 개 가능)")
+        self.text.setAlignment(Qt.AlignCenter)
+        self.text.setObjectName("Muted")
+        self.hint = QLabel("동영상 · 이미지  |  여러 파일 일괄 처리 지원")
+        self.hint.setAlignment(Qt.AlignCenter)
+        self.hint.setStyleSheet("color: %s; font-size: 10px;" % theme.FG_SUBTLE)
+        lay.addStretch(1)
+        lay.addWidget(self.icon); lay.addWidget(self.text); lay.addWidget(self.hint)
+        lay.addStretch(1)
+
+    def set_files(self, paths):
+        n = len(paths)
+        self.icon.setText("🎞")
+        if n == 1:
+            self.text.setText(os.path.basename(paths[0]))
+        else:
+            self.text.setText(f"{n}개 파일 선택됨")
+        self.text.setStyleSheet("color: %s; font-weight: 700;" % theme.FG)
+        self.hint.setText("다시 드래그/클릭하면 새로 선택")
+        self.update()
+
+    def _accepts(self, path: str) -> bool:
+        return path.lower().endswith(self.EXTS)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            from PySide6.QtWidgets import QFileDialog
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "영상/이미지 선택", "",
+                "Media (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.wmv *.flv "
+                "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff)")
+            if paths:
+                self.filesDropped.emit(list(paths))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            for u in e.mimeData().urls():
+                if self._accepts(u.toLocalFile()):
+                    e.acceptProposedAction()
+                    self._hover = True
+                    self.update()
+                    return
+
+    def dragLeaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def dropEvent(self, e):
+        self._hover = False
+        self.update()
+        paths = [u.toLocalFile() for u in e.mimeData().urls()
+                 if self._accepts(u.toLocalFile())]
+        if paths:
+            self.filesDropped.emit(paths)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(r, 14, 14)
+        if self._hover:
+            p.fillPath(path, QColor(255, 255, 255, 28))
+        else:
+            p.fillPath(path, QColor(255, 255, 255, 8))
+        pen = QPen(QColor(theme.ACCENT) if self._hover else QColor(255, 255, 255, 40),
+                   1.4)
+        pen.setStyle(Qt.DashLine)
+        p.setPen(pen)
+        p.drawPath(path)
+
+
+# ============================================================
+class TitleBar(QWidget):
+    helpRequested = Signal()
+    minimizeRequested = Signal()
+    closeRequested = Signal()
+
+    def __init__(self, title: str, subtitle: str = "", parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(52)
+        self._drag = None
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 8, 10, 8)
+        lay.setSpacing(10)
+
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {theme.ACCENT}; font-size: 13px;")
+        lay.addWidget(dot)
+
+        tbox = QVBoxLayout(); tbox.setSpacing(0)
+        t = QLabel(title); t.setObjectName("Title")
+        tbox.addWidget(t)
+        if subtitle:
+            s = QLabel(subtitle); s.setObjectName("Subtitle")
+            tbox.addWidget(s)
+        lay.addLayout(tbox)
+        lay.addStretch(1)
+
+        help_btn = QPushButton("  ?  튜토리얼  ")
+        help_btn.setObjectName("Ghost")
+        help_btn.setCursor(Qt.PointingHandCursor)
+        help_btn.clicked.connect(self.helpRequested)
+        lay.addWidget(help_btn)
+
+        mini = QPushButton("—"); mini.setObjectName("WinBtn")
+        mini.setCursor(Qt.PointingHandCursor)
+        mini.clicked.connect(self.minimizeRequested)
+        lay.addWidget(mini)
+
+        close = QPushButton("✕"); close.setObjectName("WinBtn")
+        close.setProperty("class", "close")
+        close.setObjectName("CloseBtn")
+        close.setStyleSheet("")  # objectName 스타일 사용
+        close.setCursor(Qt.PointingHandCursor)
+        close.clicked.connect(self.closeRequested)
+        lay.addWidget(close)
+
+    # 창 이동(frameless)
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = e.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.LeftButton:
+            self.window().move(e.globalPosition().toPoint() - self._drag)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
