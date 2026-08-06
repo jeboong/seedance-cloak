@@ -6,6 +6,9 @@ build/_spec/
 build/_spec_inst/
 build/_stage/
 build/_preview.png
+build/_runbtn.png
+build/_commitmsg.txt
+build/_*.png
 *.zip
 *.exe
 
