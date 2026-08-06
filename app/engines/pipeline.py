@@ -56,6 +56,11 @@ class RenderConfig:
     pad_seconds: float = 4.0
     roi_shape: str = "ellipse"
     detect_score: float = 0.6
+    # 수동 그리드(트래킹 OFF + 그리드 ON): 정규화 중심/크기 (0~1)
+    man_cx: float = 0.5
+    man_cy: float = 0.5
+    man_w: float = 0.35
+    man_h: float = 0.45
 
 
 # ============================================================
@@ -77,66 +82,85 @@ class FrameProcessor:
 
     def process(self, frame: np.ndarray, temporal: bool = True) -> np.ndarray:
         cfg = self.cfg
-        dets = self.detector.detect(frame)
-        tracks = self.tracker.update(dets, tracking=cfg.tracking)
-        self.last_count = len(tracks)
-
-        cur_gray = None
-        use_flow = temporal and cfg.tracking and cfg.methods.get("A")
-        if use_flow:
-            cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         H, W = frame.shape[:2]
-        for t in tracks:
-            x1, y1, x2, y2 = [int(v) for v in t.box]
-            x1 = max(0, min(W - 1, x1)); y1 = max(0, min(H - 1, y1))
-            x2 = max(x1 + 1, min(W, x2)); y2 = max(y1 + 1, min(H, y2))
-            if x2 - x1 < 8 or y2 - y1 < 8:
-                continue
-            box = (x1, y1, x2, y2)
-            roi = frame[y1:y2, x1:x2].copy()
-            changed = False
+        auto_grid = cfg.use_grid and cfg.tracking          # 얼굴 추적 그리드
+        manual_grid = cfg.use_grid and not cfg.tracking     # 수동 고정 그리드
+        any_engine = any(cfg.methods.values())
+        need_detect = any_engine or auto_grid
 
-            if cfg.methods.get("A"):
-                base_noise = None
-                pn = self.prev_noise.get(t.id) if cfg.tracking else None
-                if (use_flow and pn is not None and pn.shape == roi.shape[:2]
-                        and self.prev_gray is not None
-                        and self.prev_gray.shape == cur_gray.shape):
-                    try:
-                        flow = cv2.calcOpticalFlowFarneback(
-                            self.prev_gray[y1:y2, x1:x2], cur_gray[y1:y2, x1:x2],
-                            None, 0.5, 3, 15, 3, 5, 1.2, 0)
-                        rh, rw = roi.shape[:2]
-                        gx, gy = np.meshgrid(np.arange(rw, dtype=np.float32),
-                                             np.arange(rh, dtype=np.float32))
-                        mx = (gx + flow[..., 0]).astype(np.float32)
-                        my = (gy + flow[..., 1]).astype(np.float32)
-                        base_noise = cv2.remap(pn, mx, my, cv2.INTER_LINEAR)
-                    except Exception:
-                        base_noise = None
-                mod, noise = adversarial_cloak(roi, cfg.eps, base_noise)
-                if cfg.tracking:
-                    self.prev_noise[t.id] = noise
-                roi = mod
-                changed = True
+        if need_detect:
+            dets = self.detector.detect(frame)
+            tracks = self.tracker.update(dets, tracking=cfg.tracking)
+            self.last_count = len(tracks)
 
-            if cfg.methods.get("B"):
-                roi = freq_perturb(roi, cfg.strength)
-                changed = True
-            if cfg.methods.get("C"):
-                roi = semantic_evade(roi, cfg.strength)
-                changed = True
+            cur_gray = None
+            use_flow = temporal and cfg.tracking and cfg.methods.get("A")
+            if use_flow:
+                cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            if changed:
-                mask = feather_mask(y2 - y1, x2 - x1, cfg.roi_shape, 0.18)
-                blend_into(frame, roi, box, mask)
+            for t in tracks:
+                x1, y1, x2, y2 = [int(v) for v in t.box]
+                x1 = max(0, min(W - 1, x1)); y1 = max(0, min(H - 1, y1))
+                x2 = max(x1 + 1, min(W, x2)); y2 = max(y1 + 1, min(H, y2))
+                if x2 - x1 < 8 or y2 - y1 < 8:
+                    continue
+                box = (x1, y1, x2, y2)
+                roi = frame[y1:y2, x1:x2].copy()
+                changed = False
 
-            if cfg.use_grid:
-                draw_face_grid(frame, box, cfg.grid, t.angle)
+                if cfg.methods.get("A"):
+                    base_noise = None
+                    pn = self.prev_noise.get(t.id) if cfg.tracking else None
+                    if (use_flow and pn is not None and pn.shape == roi.shape[:2]
+                            and self.prev_gray is not None
+                            and self.prev_gray.shape == cur_gray.shape):
+                        try:
+                            flow = cv2.calcOpticalFlowFarneback(
+                                self.prev_gray[y1:y2, x1:x2], cur_gray[y1:y2, x1:x2],
+                                None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                            rh, rw = roi.shape[:2]
+                            gx, gy = np.meshgrid(np.arange(rw, dtype=np.float32),
+                                                 np.arange(rh, dtype=np.float32))
+                            mx = (gx + flow[..., 0]).astype(np.float32)
+                            my = (gy + flow[..., 1]).astype(np.float32)
+                            base_noise = cv2.remap(pn, mx, my, cv2.INTER_LINEAR)
+                        except Exception:
+                            base_noise = None
+                    mod, noise = adversarial_cloak(roi, cfg.eps, base_noise)
+                    if cfg.tracking:
+                        self.prev_noise[t.id] = noise
+                    roi = mod
+                    changed = True
 
-        if use_flow:
-            self.prev_gray = cur_gray
+                if cfg.methods.get("B"):
+                    roi = freq_perturb(roi, cfg.strength)
+                    changed = True
+                if cfg.methods.get("C"):
+                    roi = semantic_evade(roi, cfg.strength)
+                    changed = True
+
+                if changed:
+                    mask = feather_mask(y2 - y1, x2 - x1, cfg.roi_shape, 0.18)
+                    blend_into(frame, roi, box, mask)
+
+                if auto_grid:
+                    draw_face_grid(frame, box, cfg.grid, t.angle)
+
+            if use_flow:
+                self.prev_gray = cur_gray
+        else:
+            self.last_count = 0
+
+        # 수동 그리드: 사용자가 지정한 위치·크기에 항상 표시(검출 무관)
+        if manual_grid:
+            bw = max(6.0, cfg.man_w * W)
+            bh = max(6.0, cfg.man_h * H)
+            cx = cfg.man_cx * W
+            cy = cfg.man_cy * H
+            box = (int(cx - bw / 2), int(cy - bh / 2),
+                   int(cx + bw / 2), int(cy + bh / 2))
+            draw_face_grid(frame, box, cfg.grid, 0.0)
+
         return frame
 
 

@@ -666,6 +666,49 @@ class ThumbGrid(QWidget):
 
 
 # ============================================================
+class PreviewLabel(QLabel):
+    """미리보기 라벨. 수동 그리드 모드에서 드래그로 위치를 옮길 수 있다."""
+    dragged = Signal(float, float)   # 이미지 기준 정규화 (cx, cy)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pm_w = 0
+        self._pm_h = 0
+        self._interactive = False
+
+    def set_interactive(self, on: bool):
+        self._interactive = on
+        self.setCursor(Qt.SizeAllCursor if on else Qt.ArrowCursor)
+
+    def set_scaled(self, pixmap: QPixmap):
+        if pixmap is None or pixmap.isNull():
+            self._pm_w = self._pm_h = 0
+            super().setPixmap(QPixmap())
+            return
+        scaled = pixmap.scaled(max(1, self.width()), max(1, self.height()),
+                               Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._pm_w, self._pm_h = scaled.width(), scaled.height()
+        super().setPixmap(scaled)
+
+    def _emit(self, pos):
+        if not self._interactive or self._pm_w <= 0 or self._pm_h <= 0:
+            return
+        xo = (self.width() - self._pm_w) / 2.0
+        yo = (self.height() - self._pm_h) / 2.0
+        nx = (pos.x() - xo) / self._pm_w
+        ny = (pos.y() - yo) / self._pm_h
+        self.dragged.emit(min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny)))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._emit(e.position())
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton:
+            self._emit(e.position())
+
+
+# ============================================================
 class TitleBar(QWidget):
     helpRequested = Signal()
     minimizeRequested = Signal()

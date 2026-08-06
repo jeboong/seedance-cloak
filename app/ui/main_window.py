@@ -25,8 +25,8 @@ from app.ui.acrylic import apply_glass
 from app.ui.tutorial import TutorialDialog
 from app.ui.widgets import (CollapsibleCard, ColorSwatch, DropArea, GlassCard,
                             IconButton, LabeledSlider, NoWheelComboBox,
-                            SectionHeader, ThumbGrid, TitleBar, ToggleRow,
-                            ToggleSwitch, hline)
+                            PreviewLabel, SectionHeader, ThumbGrid, TitleBar,
+                            ToggleRow, ToggleSwitch, hline)
 
 
 # ============================================================
@@ -72,7 +72,10 @@ class MainWindow(QWidget):
         self._preview_total = 0
         self._preview_idx = 0
         self._preview_base = None      # 현재 미리보기 대상 프레임(BGR, 원본해상도)
+        self._suppress_preview = False
         self.settings = QSettings("SeedanceCloak", "app")
+        # 직전 저장 폴더 기억(세션 간 유지)
+        self._saved_dir = self.settings.value("out_dir", "", type=str) or ""
 
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -188,13 +191,15 @@ class MainWindow(QWidget):
             "미리보기",
             "설정이 아래 프레임에 실시간 반영됩니다. 슬라이더/버튼으로 프레임을 이동하세요."))
 
-        self.preview = QLabel("영상/이미지를 첨부하면\n여기에서 미리 볼 수 있어요")
+        self.preview = PreviewLabel()
+        self.preview.setText("영상/이미지를 첨부하면\n여기에서 미리 볼 수 있어요")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(320, 260)
         self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview.setStyleSheet(
             f"background: rgba(0,0,0,0.35); border:1px solid {theme.CARD_BORDER};"
             f"border-radius:12px; color:{theme.FG_SUBTLE}; font-size:11px;")
+        self.preview.dragged.connect(self._on_preview_drag)
         card.v.addWidget(self.preview, 1)
 
         # 프레임 이동 컨트롤(동영상일 때만 표시)
@@ -293,6 +298,25 @@ class MainWindow(QWidget):
         gb.addWidget(self.grid_align)
         gb.addWidget(self.grid_dots)
 
+        # 수동 배치(트래킹 OFF 시): 미리보기 드래그 또는 XY/크기 값으로 조절
+        self._manual_box = QWidget()
+        mb = QVBoxLayout(self._manual_box)
+        mb.setContentsMargins(0, 2, 0, 0)
+        mb.setSpacing(10)
+        mb.addWidget(hline())
+        mhint = QLabel("수동 배치 (트래킹 OFF) — 미리보기에서 드래그하거나 아래 값으로 위치·크기 조절")
+        mhint.setObjectName("SectionDesc")
+        mhint.setWordWrap(True)
+        mb.addWidget(mhint)
+        self.sl_mx = LabeledSlider("위치 X", 0.0, 1.0, 0.5, 100, 2)
+        self.sl_my = LabeledSlider("위치 Y", 0.0, 1.0, 0.5, 100, 2)
+        self.sl_mw = LabeledSlider("너비", 0.05, 1.0, 0.35, 95, 2)
+        self.sl_mh = LabeledSlider("높이", 0.05, 1.0, 0.45, 95, 2)
+        for w in (self.sl_mx, self.sl_my, self.sl_mw, self.sl_mh):
+            mb.addWidget(w)
+        gb.addWidget(self._manual_box)
+        self._manual_box.setVisible(False)
+
         card.v.addWidget(self._grid_box)
         self.v.addWidget(card)
 
@@ -361,6 +385,8 @@ class MainWindow(QWidget):
         orow = QHBoxLayout()
         self.out_edit = QLineEdit()
         self.out_edit.setPlaceholderText("저장할 위치/파일명…")
+        self.out_edit.editingFinished.connect(
+            lambda: self._save_out_dir(self.out_edit.text().strip()))
         btn = QPushButton("찾아보기")
         btn.setObjectName("Ghost")
         btn.setCursor(Qt.PointingHandCursor)
@@ -403,15 +429,35 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------ 미리보기 로직
     def _wire_preview(self):
         for sl in (self.sl_rows, self.sl_cols, self.sl_thick, self.sl_opacity,
-                   self.sl_margin, self.sl_dotr, self.sl_eps, self.sl_str):
+                   self.sl_margin, self.sl_dotr, self.sl_eps, self.sl_str,
+                   self.sl_mx, self.sl_my, self.sl_mw, self.sl_mh):
             sl.changed.connect(self._schedule_preview)
         for tg in (self.grid_enable, self.grid_align.sw, self.grid_dots.sw,
                    self.eng_a.sw, self.eng_b.sw, self.eng_c.sw, self.tracking.sw):
             tg.toggled.connect(self._schedule_preview)
         self.color.colorChanged.connect(lambda *_: self._schedule_preview())
         self.shape.currentIndexChanged.connect(self._schedule_preview)
+        self.grid_enable.toggled.connect(self._update_manual_visibility)
+        self.tracking.sw.toggled.connect(self._update_manual_visibility)
+        self._update_manual_visibility()
+
+    def _update_manual_visibility(self, *args):
+        manual = self.grid_enable.isChecked() and not self.tracking.isChecked()
+        self._manual_box.setVisible(manual)
+        self.preview.set_interactive(manual)
+
+    def _on_preview_drag(self, nx, ny):
+        if not (self.grid_enable.isChecked() and not self.tracking.isChecked()):
+            return
+        self._suppress_preview = True
+        self.sl_mx.setValueF(nx)
+        self.sl_my.setValueF(ny)
+        self._suppress_preview = False
+        self._render_preview()
 
     def _schedule_preview(self, *args):
+        if self._suppress_preview:
+            return
         if self._preview_base is not None:
             self._preview_timer.start(220)
 
@@ -437,8 +483,13 @@ class MainWindow(QWidget):
             proc = FrameProcessor(cfg, self._get_detector())
             out = proc.process(src, temporal=False)
             self._show_preview_rgb(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
-            faces = proc.last_count
-            bits = [f"얼굴 {faces}명 감지" if faces else "이 프레임에서 얼굴 미검출"]
+            manual = cfg.use_grid and not cfg.tracking
+            bits = []
+            if manual:
+                bits.append(f"수동 그리드 · 위치 {cfg.man_cx:.2f},{cfg.man_cy:.2f}")
+            else:
+                faces = proc.last_count
+                bits.append(f"얼굴 {faces}명 감지" if faces else "이 프레임에서 얼굴 미검출")
             if cfg.use_grid:
                 bits.append(f"그리드 {int(cfg.grid.rows)}×{int(cfg.grid.cols)}·"
                             f"{'타원' if cfg.grid.shape=='ellipse' else '사각'}")
@@ -529,10 +580,7 @@ class MainWindow(QWidget):
         try:
             h, w, ch = rgb.shape
             img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-            pix = QPixmap.fromImage(img.copy())
-            self.preview.setPixmap(pix.scaled(
-                self.preview.width(), self.preview.height(),
-                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.preview.set_scaled(QPixmap.fromImage(img.copy()))
         except Exception:
             pass
 
@@ -652,32 +700,44 @@ class MainWindow(QWidget):
             head = "이미지 · " + os.path.basename(self.inputs[0])
         self.meta.setText(head)
 
+    def _save_out_dir(self, path):
+        if not path:
+            return
+        d = path if os.path.isdir(path) else os.path.dirname(path)
+        if d:
+            self._saved_dir = d
+            self.settings.setValue("out_dir", d)
+
     def _set_default_output(self):
+        p = self.inputs[0]
+        src_dir = os.path.dirname(os.path.abspath(p))
+        use_saved = bool(self._saved_dir and os.path.isdir(self._saved_dir))
+        base_dir = self._saved_dir if use_saved else src_dir
         if len(self.inputs) == 1:
-            p = self.inputs[0]
-            base, ext = os.path.splitext(p)
-            out = base + "_cloaked.mp4" if is_video(p) else base + "_cloaked" + ext
-            self.out_edit.setText(out)
+            stem, ext = os.path.splitext(os.path.basename(p))
+            oext = ".mp4" if is_video(p) else ext
+            self.out_edit.setText(os.path.join(base_dir, stem + "_cloaked" + oext))
             self.out_label.setText("저장 경로 (파일)")
         else:
-            folder = os.path.join(
-                os.path.dirname(os.path.abspath(self.inputs[0])), "cloaked_output")
+            folder = base_dir if use_saved else os.path.join(src_dir, "cloaked_output")
             self.out_edit.setText(folder)
             self.out_label.setText("저장 폴더 (여러 파일 일괄)")
 
     def pick_output(self):
         if len(self.inputs) > 1:
             d = QFileDialog.getExistingDirectory(
-                self, "저장 폴더 선택", self.out_edit.text() or "")
+                self, "저장 폴더 선택", self.out_edit.text() or self._saved_dir or "")
             if d:
                 self.out_edit.setText(d)
+                self._save_out_dir(d)
         else:
-            cur = self.out_edit.text() or "cloaked.mp4"
+            cur = self.out_edit.text() or self._saved_dir or "cloaked.mp4"
             path, _ = QFileDialog.getSaveFileName(
                 self, "저장 위치", cur,
                 "Media (*.mp4 *.mov *.mkv *.png *.jpg *.jpeg *.webp)")
             if path:
                 self.out_edit.setText(path)
+                self._save_out_dir(path)
 
     def _build_jobs(self):
         out = self.out_edit.text().strip()
@@ -716,6 +776,8 @@ class MainWindow(QWidget):
             quality=self.quality.currentData(),
             pad_enabled=self.pad_enable.isChecked(),
             pad_seconds=self.sl_pad.valueF(),
+            man_cx=self.sl_mx.valueF(), man_cy=self.sl_my.valueF(),
+            man_w=self.sl_mw.valueF(), man_h=self.sl_mh.valueF(),
         )
 
     def on_run_clicked(self):
@@ -731,13 +793,15 @@ class MainWindow(QWidget):
             self._warn("저장 경로를 지정하세요.")
             return
         cfg = self._collect_config()
-        if not any(cfg.methods.values()) and not cfg.use_grid:
-            self._warn("회피 엔진(A/B/C) 중 하나를 켜거나 얼굴 그리드를 활성화하세요.")
+        if (not any(cfg.methods.values()) and not cfg.use_grid
+                and not cfg.pad_enabled):
+            self._warn("회피 엔진(A/B/C)·얼굴 그리드·4초 채우기 중 하나 이상을 켜세요.")
             return
         self._jobs = self._build_jobs()
         if not self._jobs:
             self._warn("저장 경로를 확인하세요.")
             return
+        self._save_out_dir(self._jobs[0][1])
 
         self._set_running(True)
         self.bar.setValue(0)

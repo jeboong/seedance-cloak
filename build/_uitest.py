@@ -62,6 +62,9 @@ try:
     win = MainWindow()
     win.resize(1080, 900)
     win.set_inputs(sample_inputs())
+    win.tracking.setChecked(False)      # 수동 그리드 모드 확인
+    win.sl_mx.setValueF(0.5)
+    win.sl_my.setValueF(0.42)
     win.show()
     win.repaint()
     ok["v"] = True
