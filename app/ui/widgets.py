@@ -32,6 +32,58 @@ class NoWheelComboBox(QComboBox):
         e.ignore()
 
 
+class IconButton(QPushButton):
+    """아이콘을 직접 그려주는 버튼(폰트 글리프 의존 X). kind: x/prev/next/refresh."""
+
+    def __init__(self, kind: str, parent=None, color: str = "#e8e9ee"):
+        super().__init__(parent)
+        self._kind = kind
+        self._color = QColor(color)
+        self.setText("")
+
+    def paintEvent(self, e):
+        super().paintEvent(e)  # 배경/보더/hover 는 QSS 로
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2.0, h / 2.0
+        r = min(w, h) * 0.22
+        if self._kind == "x":
+            pen = QPen(self._color, 2.0)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.drawLine(int(cx - r), int(cy - r), int(cx + r), int(cy + r))
+            p.drawLine(int(cx - r), int(cy + r), int(cx + r), int(cy - r))
+        elif self._kind in ("prev", "next"):
+            path = QPainterPath()
+            if self._kind == "prev":
+                path.moveTo(cx + r, cy - r); path.lineTo(cx - r, cy)
+                path.lineTo(cx + r, cy + r)
+            else:
+                path.moveTo(cx - r, cy - r); path.lineTo(cx + r, cy)
+                path.lineTo(cx - r, cy + r)
+            path.closeSubpath()
+            p.fillPath(path, self._color)
+        elif self._kind == "refresh":
+            pen = QPen(self._color, 1.7)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), 55 * 16, 250 * 16)
+            # 화살촉
+            import math
+            a = math.radians(55)
+            ex, ey = cx + r * math.cos(a), cy - r * math.sin(a)
+            p.setPen(Qt.NoPen)
+            tri = QPainterPath()
+            tri.moveTo(ex + 2.4, ey + 1.0)
+            tri.lineTo(ex - 3.0, ey - 1.2)
+            tri.lineTo(ex + 1.2, ey - 4.2)
+            tri.closeSubpath()
+            p.fillPath(tri, self._color)
+        p.end()
+
+
 # ============================================================
 class GlassCard(QFrame):
     """반투명 라운드 카드(글래스). 내부 세로 레이아웃 self.v 제공."""
@@ -234,14 +286,13 @@ class LabeledSlider(QWidget):
         top = QHBoxLayout(); top.setSpacing(6)
         self._label = QLabel(label); self._label.setObjectName("Muted")
         self._value = QLabel(); self._value.setObjectName("Value")
-        self._reset = QPushButton("↺")
+        self._reset = IconButton("refresh", color=theme.FG_MUTED)
         self._reset.setCursor(Qt.PointingHandCursor)
         self._reset.setFixedSize(20, 20)
         self._reset.setToolTip("기본값으로 되돌리기")
         self._reset.setStyleSheet(
-            f"QPushButton{{background:transparent;border:none;color:{theme.FG_SUBTLE};"
-            f"font-size:13px;border-radius:6px;padding:0;}}"
-            f"QPushButton:hover{{color:{theme.FG};background:rgba(255,255,255,0.12);}}")
+            "QPushButton{background:transparent;border:none;border-radius:6px;padding:0;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.12);}")
         self._reset.clicked.connect(self.reset)
         top.addWidget(self._label); top.addStretch(1)
         top.addWidget(self._value); top.addWidget(self._reset)
@@ -563,16 +614,16 @@ class ThumbCard(QFrame):
         name.setToolTip(os.path.basename(path))
         lay.addWidget(name)
 
-        self.rm = QPushButton("✕", self)
+        self.rm = IconButton("x", self, color="#ffffff")
         self.rm.setCursor(Qt.PointingHandCursor)
-        self.rm.setFixedSize(20, 20)
-        self.rm.move(104 - 22, 4)
+        self.rm.setFixedSize(22, 22)
+        self.rm.move(104 - 24, 4)
         self.rm.setToolTip("제거")
         self.rm.setStyleSheet(
-            "QPushButton{background: rgba(0,0,0,0.55); color: white; border:none;"
-            "border-radius:10px; font-size:11px;}"
-            "QPushButton:hover{background: rgba(0,0,0,0.85);}")
+            "QPushButton{background: rgba(0,0,0,0.62); border:none; border-radius:11px;}"
+            "QPushButton:hover{background: #ef4444;}")
         self.rm.clicked.connect(lambda: self.removeRequested.emit(self.path))
+        self.rm.raise_()
 
 
 class ThumbGrid(QWidget):

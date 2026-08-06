@@ -72,6 +72,7 @@ try:
         win._render_preview()
         out = ROOT / "build" / "_preview.png"
         win.grab().save(str(out))
+        win.run_btn.grab().save(str(ROOT / "build" / "_runbtn.png"))
         print("[ok] 스크린샷 저장:", out)
         qapp.quit()
     QTimer.singleShot(2200, _grab)

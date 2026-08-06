@@ -68,6 +68,7 @@ class FrameProcessor:
         self.tracker = FaceTracker(smooth=0.5, max_age=8)
         self.prev_gray = None
         self.prev_noise: dict[int, np.ndarray] = {}
+        self.last_count = 0
 
     def reset(self):
         self.tracker.reset()
@@ -78,6 +79,7 @@ class FrameProcessor:
         cfg = self.cfg
         dets = self.detector.detect(frame)
         tracks = self.tracker.update(dets, tracking=cfg.tracking)
+        self.last_count = len(tracks)
 
         cur_gray = None
         use_flow = temporal and cfg.tracking and cfg.methods.get("A")

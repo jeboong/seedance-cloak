@@ -10,8 +10,8 @@ from PySide6.QtGui import (QColor, QImage, QLinearGradient, QPainter,
                            QPainterPath, QPixmap)
 from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QProgressBar, QPushButton,
-                               QScrollArea, QSizeGrip, QSizePolicy, QTextEdit,
-                               QVBoxLayout, QWidget)
+                               QScrollArea, QSizeGrip, QSizePolicy, QSlider,
+                               QSplitter, QTextEdit, QVBoxLayout, QWidget)
 
 import app
 from app.engines import ffmpeg_utils as ff
@@ -24,8 +24,9 @@ from app.ui import theme
 from app.ui.acrylic import apply_glass
 from app.ui.tutorial import TutorialDialog
 from app.ui.widgets import (CollapsibleCard, ColorSwatch, DropArea, GlassCard,
-                            LabeledSlider, NoWheelComboBox, SectionHeader,
-                            ThumbGrid, TitleBar, ToggleRow, ToggleSwitch, hline)
+                            IconButton, LabeledSlider, NoWheelComboBox,
+                            SectionHeader, ThumbGrid, TitleBar, ToggleRow,
+                            ToggleSwitch, hline)
 
 
 # ============================================================
@@ -63,10 +64,14 @@ class MainWindow(QWidget):
         self._running = False
         self._glass = False
         self._detector = None
-        self._first_frame = None
         self._last_preview_rgb = None
         self._checker = None
         self._downloader = None
+        # 미리보기 프레임 상태
+        self._preview_cap = None
+        self._preview_total = 0
+        self._preview_idx = 0
+        self._preview_base = None      # 현재 미리보기 대상 프레임(BGR, 원본해상도)
         self.settings = QSettings("SeedanceCloak", "app")
 
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -93,14 +98,11 @@ class MainWindow(QWidget):
         self._build_banner()
         root.addWidget(self.banner)
 
-        body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(0)
-
-        # 좌: 스크롤 컨트롤
+        # 좌: 스크롤 컨트롤 / 우: 미리보기 — 가운데 분리바(splitter)로 폭 조절
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setMinimumWidth(400)
         scroll.viewport().setStyleSheet("background: transparent;")
         content = QWidget()
         content.setAttribute(Qt.WA_StyledBackground, True)
@@ -109,11 +111,19 @@ class MainWindow(QWidget):
         self.v = QVBoxLayout(content)
         self.v.setContentsMargins(18, 6, 12, 18)
         self.v.setSpacing(14)
-        body.addWidget(scroll, 1)
 
-        # 우: 라이브 미리보기(고정)
-        body.addWidget(self._build_preview_panel(), 0)
-        root.addLayout(body, 1)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        splitter.setStyleSheet(
+            "QSplitter::handle{background: rgba(255,255,255,0.06);}"
+            "QSplitter::handle:hover{background: rgba(255,255,255,0.18);}")
+        splitter.addWidget(scroll)
+        splitter.addWidget(self._build_preview_panel())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([520, 520])
+        root.addWidget(splitter, 1)
 
         self._build_dropcard()
         self._build_grid_card()       # 1순위
@@ -133,6 +143,11 @@ class MainWindow(QWidget):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._render_preview)
+        self._seek_timer = QTimer(self)
+        self._seek_timer.setSingleShot(True)
+        self._seek_timer.timeout.connect(self._do_seek)
+        self._pending_seek = 0
+        self._frame_guard = False
         self._wire_preview()
 
         QTimer.singleShot(350, self._maybe_first_run)
@@ -167,27 +182,49 @@ class MainWindow(QWidget):
 
     def _build_preview_panel(self) -> QWidget:
         card = GlassCard(pad=14)
-        card.setFixedWidth(360)
-        card.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        head = QHBoxLayout()
-        head.addWidget(SectionHeader("미리보기", "현재 설정이 첫 프레임에 실시간 반영됩니다."), 1)
-        self.btn_refresh = QPushButton("↻")
-        self.btn_refresh.setObjectName("Ghost")
-        self.btn_refresh.setFixedSize(30, 28)
-        self.btn_refresh.setToolTip("미리보기 새로고침")
-        self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.clicked.connect(self._render_preview)
-        head.addWidget(self.btn_refresh, 0, Qt.AlignTop)
-        card.v.addLayout(head)
+        card.setMinimumWidth(340)
+        card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        card.v.addWidget(SectionHeader(
+            "미리보기",
+            "설정이 아래 프레임에 실시간 반영됩니다. 슬라이더/버튼으로 프레임을 이동하세요."))
 
         self.preview = QLabel("영상/이미지를 첨부하면\n여기에서 미리 볼 수 있어요")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(320, 300)
+        self.preview.setMinimumSize(320, 260)
         self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview.setStyleSheet(
             f"background: rgba(0,0,0,0.35); border:1px solid {theme.CARD_BORDER};"
             f"border-radius:12px; color:{theme.FG_SUBTLE}; font-size:11px;")
         card.v.addWidget(self.preview, 1)
+
+        # 프레임 이동 컨트롤(동영상일 때만 표시)
+        self._frame_row = QWidget()
+        fr = QHBoxLayout(self._frame_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.setSpacing(8)
+        self.btn_prev = IconButton("prev")
+        self.btn_next = IconButton("next")
+        for b in (self.btn_prev, self.btn_next):
+            b.setObjectName("Ghost")
+            b.setFixedSize(34, 28)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip("1프레임 이동")
+        self.btn_prev.clicked.connect(lambda: self._step_frame(-1))
+        self.btn_next.clicked.connect(lambda: self._step_frame(1))
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.valueChanged.connect(self._on_frame_slider)
+        self.frame_slider.setStyleSheet(
+            "QSlider::groove:horizontal{height:6px;border-radius:3px;"
+            "background:rgba(255,255,255,0.10);}"
+            f"QSlider::sub-page:horizontal{{height:6px;border-radius:3px;background:{theme.ACCENT};}}"
+            f"QSlider::handle:horizontal{{width:14px;height:14px;margin:-5px 0;"
+            f"border-radius:7px;background:{theme.FG};border:2px solid {theme.BG};}}")
+        fr.addWidget(self.btn_prev)
+        fr.addWidget(self.frame_slider, 1)
+        fr.addWidget(self.btn_next)
+        card.v.addWidget(self._frame_row)
+        self._frame_row.setVisible(False)
 
         self.preview_caption = QLabel("")
         self.preview_caption.setObjectName("SectionDesc")
@@ -265,7 +302,7 @@ class MainWindow(QWidget):
             "얼굴 검출·매칭을 방해하는 처리. 필요할 때 펼쳐서 사용하세요.",
             expanded=False)
         self.eng_a = ToggleRow("A · Adversarial Cloak",
-                               "검출기를 속이는 미세 노이즈 (권장)", True)
+                               "검출기를 속이는 미세 노이즈 (권장)", False)
         self.eng_b = ToggleRow("B · Frequency Perturb",
                                "얼굴 임베딩/매칭 회피 (인물 매칭 대비)", False)
         self.eng_c = ToggleRow("C · Semantic Evade", "검출 자체 방해 (보험)", False)
@@ -375,7 +412,7 @@ class MainWindow(QWidget):
         self.shape.currentIndexChanged.connect(self._schedule_preview)
 
     def _schedule_preview(self, *args):
-        if self._first_frame is not None:
+        if self._preview_base is not None:
             self._preview_timer.start(220)
 
     def _get_detector(self):
@@ -383,35 +420,103 @@ class MainWindow(QWidget):
             self._detector = FaceDetector(score_threshold=0.6)
         return self._detector
 
-    def _preview_source(self):
-        f = self._first_frame
-        if f is None:
-            return None
+    def _downscale_for_preview(self, f):
         h, w = f.shape[:2]
         if w > 960:
             s = 960.0 / w
-            f = cv2.resize(f, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+            return cv2.resize(f, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
         return f.copy()
 
     def _render_preview(self):
-        src = self._preview_source()
-        if src is None:
+        base = self._preview_base
+        if base is None:
             return
         try:
+            src = self._downscale_for_preview(base)
             cfg = self._collect_config()
             proc = FrameProcessor(cfg, self._get_detector())
             out = proc.process(src, temporal=False)
             self._show_preview_rgb(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
-            bits = []
+            faces = proc.last_count
+            bits = [f"얼굴 {faces}명 감지" if faces else "이 프레임에서 얼굴 미검출"]
             if cfg.use_grid:
                 bits.append(f"그리드 {int(cfg.grid.rows)}×{int(cfg.grid.cols)}·"
                             f"{'타원' if cfg.grid.shape=='ellipse' else '사각'}")
             eng = [k for k, v in cfg.methods.items() if v]
             if eng:
                 bits.append("엔진 " + "·".join(eng))
-            self.preview_caption.setText("  |  ".join(bits) if bits else "적용 없음")
+            if self._preview_total > 1:
+                bits.append(f"프레임 {self._preview_idx + 1}/{self._preview_total}")
+            self.preview_caption.setText("  ·  ".join(bits))
         except Exception:
             pass
+
+    # ---- 프레임 이동 ----
+    def _release_preview_cap(self):
+        if self._preview_cap is not None:
+            try:
+                self._preview_cap.release()
+            except Exception:
+                pass
+        self._preview_cap = None
+
+    def _find_face_frame(self, cap, total):
+        """얼굴이 잡히는 프레임을 찾아 (idx, frame) 반환. 없으면 첫 프레임."""
+        det = self._get_detector()
+        if total and total > 1:
+            n = min(14, total)
+            step = max(1, total // n)
+            candidates = list(range(0, total, step))[:n]
+        else:
+            candidates = [0]
+        first = None
+        for idx in candidates:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, fr = cap.read()
+            if not ok:
+                continue
+            if first is None:
+                first = (idx, fr)
+            try:
+                if det.detect(self._downscale_for_preview(fr)):
+                    return idx, fr
+            except Exception:
+                pass
+        if first is not None:
+            return first
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, fr = cap.read()
+        return (0, fr if ok else None)
+
+    def _step_frame(self, delta):
+        if self._preview_cap is None or self._preview_total <= 1:
+            return
+        idx = max(0, min(self._preview_total - 1, self._preview_idx + delta))
+        self._frame_guard = True
+        self.frame_slider.setValue(idx)
+        self._frame_guard = False
+        self._seek_and_render(idx)
+
+    def _on_frame_slider(self, val):
+        if self._frame_guard:
+            return
+        self._pending_seek = val
+        self._seek_timer.start(60)
+
+    def _do_seek(self):
+        self._seek_and_render(self._pending_seek)
+
+    def _seek_and_render(self, idx):
+        cap = self._preview_cap
+        if cap is None:
+            return
+        idx = max(0, min(self._preview_total - 1, int(idx)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, fr = cap.read()
+        if ok:
+            self._preview_base = fr
+            self._preview_idx = idx
+            self._render_preview()
 
     def _show_preview_rgb(self, rgb):
         self._last_preview_rgb = rgb
@@ -467,43 +572,56 @@ class MainWindow(QWidget):
         if has:
             self._update_meta()
             self._set_default_output()
-            self._load_first_frame()
+            self._load_preview_source()
         else:
             self.meta.setText("첨부된 파일 없음")
-            self._first_frame = None
+            self._release_preview_cap()
+            self._preview_base = None
             self._last_preview_rgb = None
+            self._preview_total = 0
+            self._frame_row.setVisible(False)
             self.preview.setPixmap(QPixmap())
             self.preview.setText("영상/이미지를 첨부하면\n여기에서 미리 볼 수 있어요")
             self.preview_caption.setText("")
             self.out_edit.clear()
 
-    def _load_first_frame(self):
-        self._first_frame = None
+    def _load_preview_source(self):
+        self._release_preview_cap()
+        self._preview_base = None
         self._last_preview_rgb = None
+        self._preview_total = 0
+        self._preview_idx = 0
         p = self.inputs[0]
         try:
             if is_video(p):
                 cap = cv2.VideoCapture(p)
-                ok, fr = cap.read()
-                cap.release()
-                self._first_frame = fr if ok else None
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                self._preview_cap = cap
+                self._preview_total = max(0, total)
+                idx, frame = self._find_face_frame(cap, total)
+                self._preview_idx = idx
+                self._preview_base = frame
+                self._frame_guard = True
+                self.frame_slider.setRange(0, max(0, total - 1) if total > 1 else 0)
+                self.frame_slider.setValue(idx)
+                self._frame_guard = False
+                self._frame_row.setVisible(total > 1)
             else:
                 data = _imread_unicode(p)
                 if data is not None:
                     if data.ndim == 2:
-                        self._first_frame = cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
+                        self._preview_base = cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
                     elif data.shape[2] == 4:
-                        self._first_frame = cv2.cvtColor(data, cv2.COLOR_BGRA2BGR)
+                        self._preview_base = cv2.cvtColor(data, cv2.COLOR_BGRA2BGR)
                     else:
-                        self._first_frame = data[:, :, :3].copy()
+                        self._preview_base = data[:, :, :3].copy()
+                self._frame_row.setVisible(False)
         except Exception:
-            self._first_frame = None
+            self._preview_base = None
+            self._frame_row.setVisible(False)
 
-        if self._first_frame is not None:
-            # 원본 썸네일 즉시 표시 후, 설정 반영 미리보기 예약
-            small = self._preview_source()
-            self._show_preview_rgb(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
-            self._preview_timer.start(120)
+        if self._preview_base is not None:
+            self._render_preview()
         else:
             self.preview.setText("첫 프레임을 불러오지 못했습니다")
 
