@@ -3,11 +3,13 @@
 영상 속 **얼굴만** 골라 (1) 검출·매칭을 회피하는 미세 처리를 하거나 (2) 얼굴에 맞춘 **격자(그리드)** 를 씌우는 데스크톱 도구입니다. 배경 화질은 그대로 유지합니다.
 
 - 모노크롬(Black & White) shadcn 다크 UI (PySide6, frameless + Windows 아크릴 블러)
-- 동영상 + **이미지 단일·복수(배치)** 처리
+- 동영상 + **이미지 단일·복수(배치)** 처리 — 여러 파일은 **썸네일 카드 그리드**로 표시
+- **실시간 미리보기**: 렌더 전에 첫 프레임에 설정(그리드/엔진)을 실시간 반영
 - YuNet 고정밀 얼굴 검출 + 프레임 간 트래킹/스무딩(플리커 방지)
 - 4가지 엔진: A(Adversarial) · B(Frequency) · C(Semantic) · D(Face Grid)
 - **FFmpeg 9.0** 번들, raw 프레임 단일 인코딩으로 원본 화질 보존
 - 짧은 영상(≤목표초) 뒤에 검은 화면을 이어붙이는 **4초 채우기**
+- **자동 업데이트**: 새 릴리스 감지 시 원클릭 설치
 - 회사 동료 배포용 **원클릭 설치기 / 단일 exe** 패키징
 
 > ⚠️ 이 도구는 본인이 권리를 가진 영상/이미지의 프라이버시 보호·워크플로 용도로만 사용하세요.
@@ -16,11 +18,17 @@
 
 ## 다운로드 (동료용 · 클릭 한 번)
 
-- 설치판(권장): **[SeedanceCloak-Setup.exe](https://github.com/jeboong/seedance-cloak/releases/download/v2.0.0/SeedanceCloak-Setup.exe)** — 더블클릭하면 설치 + 자동 실행 (관리자 권한 불필요)
-- 포터블(zip): **[SeedanceCloak_v2.0.0.zip](https://github.com/jeboong/seedance-cloak/releases/download/v2.0.0/SeedanceCloak_v2.0.0.zip)** — 압축 해제 후 `SeedanceCloak.exe` 실행
-- 전체 릴리스: https://github.com/jeboong/seedance-cloak/releases/tag/v2.0.0
+- 설치판(권장): **[SeedanceCloak-Setup.exe](https://github.com/jeboong/seedance-cloak/releases/latest/download/SeedanceCloak-Setup.exe)** — 더블클릭하면 설치 + 자동 실행 (관리자 권한 불필요, 항상 최신)
+- 포터블(zip) 및 전체 릴리스: https://github.com/jeboong/seedance-cloak/releases/latest
 
 > 최초 실행 시 Windows SmartScreen 경고가 뜨면 **추가 정보 → 실행**을 누르세요(코드 서명 미적용). Windows 10/11 (64-bit).
+> 새 버전이 나오면 앱이 실행 시 자동으로 감지해 **원클릭 업데이트**를 안내합니다.
+
+## 데모: 얼굴 그리드
+
+![얼굴 그리드 데모](docs/demo_grid.gif)
+
+얼굴을 자동 인식해 크기·위치·기울기에 맞춰 격자를 씌웁니다. (격자 수·두께·색·투명도·모양 조절 가능)
 
 ---
 

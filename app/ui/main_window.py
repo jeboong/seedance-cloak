@@ -1,29 +1,59 @@
-"""메인 윈도우 — 글래스모피즘 다크 UI 조립 + 렌더 파이프라인 연동."""
+"""메인 윈도우 — 2단(좌: 컨트롤 / 우: 라이브 미리보기) 글래스 다크 UI + 파이프라인 연동."""
 
 from __future__ import annotations
 
 import os
 
 import cv2
-from PySide6.QtCore import QRectF, QSettings, Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
-                               QLineEdit, QMessageBox, QPushButton, QScrollArea,
-                               QSizeGrip, QVBoxLayout, QWidget)
+from PySide6.QtCore import (QRectF, QSettings, Qt, QThread, QTimer, Signal)
+from PySide6.QtGui import (QColor, QImage, QLinearGradient, QPainter,
+                           QPainterPath, QPixmap)
+from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel,
+                               QLineEdit, QMessageBox, QProgressBar, QPushButton,
+                               QScrollArea, QSizeGrip, QSizePolicy, QTextEdit,
+                               QVBoxLayout, QWidget)
 
 import app
 from app.engines import ffmpeg_utils as ff
+from app.engines import updater
+from app.engines.detector import FaceDetector
 from app.engines.grid import GridParams
-from app.engines.pipeline import (RenderConfig, MediaWorker, is_image,
-                                  is_video)
+from app.engines.pipeline import (FrameProcessor, MediaWorker, RenderConfig,
+                                   _imread_unicode, is_image, is_video)
 from app.ui import theme
 from app.ui.acrylic import apply_glass
 from app.ui.tutorial import TutorialDialog
-from app.ui.widgets import (ColorSwatch, DropArea, GlassCard, LabeledSlider,
-                            SectionHeader, TitleBar, ToggleRow, ToggleSwitch,
-                            hline)
+from app.ui.widgets import (CollapsibleCard, ColorSwatch, DropArea, GlassCard,
+                            LabeledSlider, NoWheelComboBox, SectionHeader,
+                            ThumbGrid, TitleBar, ToggleRow, ToggleSwitch, hline)
 
 
+# ============================================================
+class _CheckThread(QThread):
+    result = Signal(object)
+
+    def run(self):
+        self.result.emit(updater.check_for_update())
+
+
+class _DownloadThread(QThread):
+    progress = Signal(float)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            path = updater.download_setup(self.url, lambda f: self.progress.emit(f))
+            self.done.emit(path)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+# ============================================================
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -32,12 +62,17 @@ class MainWindow(QWidget):
         self.worker = None
         self._running = False
         self._glass = False
+        self._detector = None
+        self._first_frame = None
+        self._last_preview_rgb = None
+        self._checker = None
+        self._downloader = None
         self.settings = QSettings("SeedanceCloak", "app")
 
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setMinimumSize(600, 680)
-        self.resize(660, 900)
+        self.setMinimumSize(940, 680)
+        self.resize(1040, 880)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -48,13 +83,21 @@ class MainWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self.titlebar = TitleBar(
-            f"{app.__app_name__}", f"Reference Cloak · v{app.__version__}")
+        self.titlebar = TitleBar(app.__app_name__,
+                                 f"Reference Cloak · v{app.__version__}")
         self.titlebar.helpRequested.connect(self.show_tutorial)
         self.titlebar.minimizeRequested.connect(self.showMinimized)
         self.titlebar.closeRequested.connect(self.close)
         root.addWidget(self.titlebar)
 
+        self._build_banner()
+        root.addWidget(self.banner)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        # 좌: 스크롤 컨트롤
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
@@ -63,18 +106,22 @@ class MainWindow(QWidget):
         content.setAttribute(Qt.WA_StyledBackground, True)
         content.setStyleSheet("background: transparent;")
         scroll.setWidget(content)
-        root.addWidget(scroll, 1)
-
         self.v = QVBoxLayout(content)
-        self.v.setContentsMargins(18, 6, 18, 18)
+        self.v.setContentsMargins(18, 6, 12, 18)
         self.v.setSpacing(14)
+        body.addWidget(scroll, 1)
+
+        # 우: 라이브 미리보기(고정)
+        body.addWidget(self._build_preview_panel(), 0)
+        root.addLayout(body, 1)
 
         self._build_dropcard()
-        self._build_engines_card()
-        self._build_grid_card()
+        self._build_grid_card()       # 1순위
+        self._build_engines_card()    # 2순위(접힘)
         self._build_general_card()
         self._build_output_card()
         self._build_run_card()
+        self.v.addStretch(1)
 
         grip_row = QHBoxLayout()
         grip_row.addStretch(1)
@@ -83,50 +130,96 @@ class MainWindow(QWidget):
         grip_row.addWidget(grip, 0, Qt.AlignRight | Qt.AlignBottom)
         root.addLayout(grip_row)
 
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._render_preview)
+        self._wire_preview()
+
         QTimer.singleShot(350, self._maybe_first_run)
+        QTimer.singleShot(1200, self._start_update_check)
+
+    # ------------------------------------------------------------ 배너/미리보기
+    def _build_banner(self):
+        self.banner = QFrame()
+        self.banner.setVisible(False)
+        self.banner.setStyleSheet(
+            f"QFrame{{background: rgba(255,255,255,0.06);"
+            f"border-bottom:1px solid {theme.CARD_BORDER};}}")
+        lay = QHBoxLayout(self.banner)
+        lay.setContentsMargins(16, 8, 12, 8)
+        self.banner_label = QLabel("새 버전이 있습니다.")
+        self.banner_label.setObjectName("Muted")
+        lay.addWidget(self.banner_label, 1)
+        self.banner_pb = QProgressBar()
+        self.banner_pb.setFixedWidth(140)
+        self.banner_pb.setVisible(False)
+        lay.addWidget(self.banner_pb)
+        self.btn_update = QPushButton("지금 업데이트")
+        self.btn_update.setObjectName("Ghost")
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.clicked.connect(self._do_update)
+        lay.addWidget(self.btn_update)
+        self.btn_later = QPushButton("나중에")
+        self.btn_later.setObjectName("Ghost")
+        self.btn_later.setCursor(Qt.PointingHandCursor)
+        self.btn_later.clicked.connect(lambda: self.banner.setVisible(False))
+        lay.addWidget(self.btn_later)
+
+    def _build_preview_panel(self) -> QWidget:
+        card = GlassCard(pad=14)
+        card.setFixedWidth(360)
+        card.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        head = QHBoxLayout()
+        head.addWidget(SectionHeader("미리보기", "현재 설정이 첫 프레임에 실시간 반영됩니다."), 1)
+        self.btn_refresh = QPushButton("↻")
+        self.btn_refresh.setObjectName("Ghost")
+        self.btn_refresh.setFixedSize(30, 28)
+        self.btn_refresh.setToolTip("미리보기 새로고침")
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.clicked.connect(self._render_preview)
+        head.addWidget(self.btn_refresh, 0, Qt.AlignTop)
+        card.v.addLayout(head)
+
+        self.preview = QLabel("영상/이미지를 첨부하면\n여기에서 미리 볼 수 있어요")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(320, 300)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setStyleSheet(
+            f"background: rgba(0,0,0,0.35); border:1px solid {theme.CARD_BORDER};"
+            f"border-radius:12px; color:{theme.FG_SUBTLE}; font-size:11px;")
+        card.v.addWidget(self.preview, 1)
+
+        self.preview_caption = QLabel("")
+        self.preview_caption.setObjectName("SectionDesc")
+        self.preview_caption.setWordWrap(True)
+        card.v.addWidget(self.preview_caption)
+        return card
 
     # ------------------------------------------------------------------ cards
     def _build_dropcard(self):
         card = GlassCard()
         card.v.addWidget(SectionHeader(
             "영상·이미지 첨부",
-            "얼굴이 있는 영상/이미지를 넣으면 얼굴만 처리합니다. 여러 개를 한 번에 처리(배치)할 수 있어요."))
+            "얼굴이 있는 영상/이미지를 넣으면 얼굴만 처리합니다. 여러 개 일괄 처리 가능."))
         self.drop = DropArea()
         self.drop.filesDropped.connect(self.set_inputs)
         card.v.addWidget(self.drop)
+        self.thumbs = ThumbGrid()
+        self.thumbs.changed.connect(self._on_thumbs_changed)
+        self.thumbs.setVisible(False)
+        card.v.addWidget(self.thumbs)
         self.meta = QLabel("첨부된 파일 없음")
         self.meta.setObjectName("Muted")
         card.v.addWidget(self.meta)
         self.v.addWidget(card)
 
-    def _build_engines_card(self):
-        card = GlassCard()
-        card.v.addWidget(SectionHeader(
-            "회피 엔진", "여러 개를 함께 켤 수 있습니다. 강도는 아래 슬라이더로 조절."))
-        self.eng_a = ToggleRow("A · Adversarial Cloak",
-                               "검출기를 속이는 미세 노이즈 (권장)", True)
-        self.eng_b = ToggleRow("B · Frequency Perturb",
-                               "얼굴 임베딩/매칭 회피 (인물 매칭 대비)", False)
-        self.eng_c = ToggleRow("C · Semantic Evade",
-                               "검출 자체 방해 (보험)", False)
-        for w in (self.eng_a, self.eng_b, self.eng_c):
-            card.v.addWidget(w)
-        card.v.addWidget(hline())
-        self.sl_eps = LabeledSlider("A 강도 (eps · 낮을수록 품질↑)",
-                                    2, 30, 6, steps=28, decimals=0, suffix=" /255")
-        self.sl_str = LabeledSlider("B·C 강도 (strength)",
-                                    0.01, 0.20, 0.05, steps=19, decimals=2)
-        card.v.addWidget(self.sl_eps)
-        card.v.addWidget(self.sl_str)
-        self.v.addWidget(card)
-
     def _build_grid_card(self):
         card = GlassCard()
         head = QHBoxLayout()
-        sh = SectionHeader("얼굴 그리드 (신규)",
-                           "얼굴 크기·위치에 맞춰 격자를 씌웁니다.")
-        head.addWidget(sh, 1)
+        head.addWidget(SectionHeader(
+            "얼굴 그리드", "얼굴 크기·위치에 맞춰 격자를 씌웁니다."), 1)
         self.grid_enable = ToggleSwitch()
+        self.grid_enable.setChecked(True)
         self.grid_enable.toggled.connect(self._toggle_grid_controls)
         head.addWidget(self.grid_enable, 0, Qt.AlignTop)
         card.v.addLayout(head)
@@ -152,20 +245,39 @@ class MainWindow(QWidget):
         row1.addWidget(self.color)
         row1.addSpacing(16)
         row1.addWidget(QLabel("모양")); row1.addSpacing(6)
-        self.shape = QComboBox()
+        self.shape = NoWheelComboBox()
         self.shape.addItem("타원(얼굴형)", "ellipse")
         self.shape.addItem("사각형", "rect")
         row1.addWidget(self.shape, 1)
         gb.addLayout(row1)
 
-        self.grid_align = ToggleRow("얼굴 기울기 정렬",
-                                    "눈 위치 기준으로 격자를 회전", True)
+        self.grid_align = ToggleRow("얼굴 기울기 정렬", "눈 위치 기준으로 격자를 회전", True)
         self.grid_dots = ToggleRow("교차점 점 표시", "", False)
         gb.addWidget(self.grid_align)
         gb.addWidget(self.grid_dots)
 
         card.v.addWidget(self._grid_box)
-        self._grid_box.setVisible(False)
+        self.v.addWidget(card)
+
+    def _build_engines_card(self):
+        card = CollapsibleCard(
+            "회피 엔진 (A · B · C)",
+            "얼굴 검출·매칭을 방해하는 처리. 필요할 때 펼쳐서 사용하세요.",
+            expanded=False)
+        self.eng_a = ToggleRow("A · Adversarial Cloak",
+                               "검출기를 속이는 미세 노이즈 (권장)", True)
+        self.eng_b = ToggleRow("B · Frequency Perturb",
+                               "얼굴 임베딩/매칭 회피 (인물 매칭 대비)", False)
+        self.eng_c = ToggleRow("C · Semantic Evade", "검출 자체 방해 (보험)", False)
+        for w in (self.eng_a, self.eng_b, self.eng_c):
+            card.body.addWidget(w)
+        card.body.addWidget(hline())
+        self.sl_eps = LabeledSlider("A 강도 (eps · 낮을수록 품질↑)",
+                                    2, 30, 6, steps=28, decimals=0, suffix=" /255")
+        self.sl_str = LabeledSlider("B·C 강도 (strength)",
+                                    0.01, 0.20, 0.05, steps=19, decimals=2)
+        card.body.addWidget(self.sl_eps)
+        card.body.addWidget(self.sl_str)
         self.v.addWidget(card)
 
     def _build_general_card(self):
@@ -179,7 +291,7 @@ class MainWindow(QWidget):
 
         qrow = QVBoxLayout(); qrow.setSpacing(4)
         qrow.addWidget(_muted("렌더링 품질"))
-        self.quality = QComboBox()
+        self.quality = NoWheelComboBox()
         for key, p in ff.QUALITY_PRESETS.items():
             self.quality.addItem(p.label, key)
         self.quality.setCurrentIndex(
@@ -222,45 +334,178 @@ class MainWindow(QWidget):
 
     def _build_run_card(self):
         card = GlassCard()
-        prow = QHBoxLayout()
-        self.preview = QLabel("처리 중 미리보기가 여기에 표시됩니다")
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumHeight(190)
-        self.preview.setStyleSheet(
-            f"background: rgba(0,0,0,0.30); border:1px solid {theme.CARD_BORDER};"
-            f"border-radius:12px; color:{theme.FG_SUBTLE}; font-size:11px;")
-        prow.addWidget(self.preview)
-        card.v.addLayout(prow)
-
-        from PySide6.QtWidgets import QProgressBar, QTextEdit
         self.bar = QProgressBar(); self.bar.setValue(0)
         card.v.addWidget(self.bar)
-        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(96)
+        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(92)
         card.v.addWidget(self.log)
 
         self.run_btn = QPushButton("실행")
-        self.run_btn.setObjectName("Primary")
         self.run_btn.setCursor(Qt.PointingHandCursor)
+        self._style_run_button(running=False)
         self.run_btn.clicked.connect(self.on_run_clicked)
         card.v.addWidget(self.run_btn)
         self.v.addWidget(card)
 
+    def _style_run_button(self, running: bool):
+        # 인라인 스타일로 확실히 밝은 프라이머리 버튼 보장(어두움 문제 방지)
+        if running:
+            bg, hover, fg = theme.CARD_HOVER, theme.CARD_HOVER, theme.FG
+            border = f"1px solid {theme.INPUT_BORDER}"
+            self.run_btn.setText("취소")
+        else:
+            bg, hover, fg = theme.ACCENT, theme.ACCENT_HOVER, theme.ON_ACCENT
+            border = "none"
+            self.run_btn.setText("실행")
+        self.run_btn.setStyleSheet(
+            f"QPushButton{{background:{bg};color:{fg};border:{border};"
+            f"border-radius:12px;padding:14px;font-weight:700;font-size:14px;}}"
+            f"QPushButton:hover{{background:{hover};}}"
+            f"QPushButton:disabled{{background:rgba(255,255,255,0.25);"
+            f"color:rgba(9,9,11,0.5);}}")
+
+    # ------------------------------------------------------------ 미리보기 로직
+    def _wire_preview(self):
+        for sl in (self.sl_rows, self.sl_cols, self.sl_thick, self.sl_opacity,
+                   self.sl_margin, self.sl_dotr, self.sl_eps, self.sl_str):
+            sl.changed.connect(self._schedule_preview)
+        for tg in (self.grid_enable, self.grid_align.sw, self.grid_dots.sw,
+                   self.eng_a.sw, self.eng_b.sw, self.eng_c.sw, self.tracking.sw):
+            tg.toggled.connect(self._schedule_preview)
+        self.color.colorChanged.connect(lambda *_: self._schedule_preview())
+        self.shape.currentIndexChanged.connect(self._schedule_preview)
+
+    def _schedule_preview(self, *args):
+        if self._first_frame is not None:
+            self._preview_timer.start(220)
+
+    def _get_detector(self):
+        if self._detector is None:
+            self._detector = FaceDetector(score_threshold=0.6)
+        return self._detector
+
+    def _preview_source(self):
+        f = self._first_frame
+        if f is None:
+            return None
+        h, w = f.shape[:2]
+        if w > 960:
+            s = 960.0 / w
+            f = cv2.resize(f, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+        return f.copy()
+
+    def _render_preview(self):
+        src = self._preview_source()
+        if src is None:
+            return
+        try:
+            cfg = self._collect_config()
+            proc = FrameProcessor(cfg, self._get_detector())
+            out = proc.process(src, temporal=False)
+            self._show_preview_rgb(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+            bits = []
+            if cfg.use_grid:
+                bits.append(f"그리드 {int(cfg.grid.rows)}×{int(cfg.grid.cols)}·"
+                            f"{'타원' if cfg.grid.shape=='ellipse' else '사각'}")
+            eng = [k for k, v in cfg.methods.items() if v]
+            if eng:
+                bits.append("엔진 " + "·".join(eng))
+            self.preview_caption.setText("  |  ".join(bits) if bits else "적용 없음")
+        except Exception:
+            pass
+
+    def _show_preview_rgb(self, rgb):
+        self._last_preview_rgb = rgb
+        self._repaint_preview()
+
+    def _repaint_preview(self):
+        rgb = self._last_preview_rgb
+        if rgb is None:
+            return
+        try:
+            h, w, ch = rgb.shape
+            img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(img.copy())
+            self.preview.setPixmap(pix.scaled(
+                self.preview.width(), self.preview.height(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        except Exception:
+            pass
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._repaint_preview()
+
     # ------------------------------------------------------------------ logic
     def _toggle_grid_controls(self, v):
         self._grid_box.setVisible(v)
+        self._schedule_preview()
 
     def _update_quality_desc(self):
         key = self.quality.currentData()
         self.quality_desc.setText(ff.QUALITY_PRESETS[key].desc)
 
     def set_inputs(self, paths):
-        paths = [p for p in paths if is_image(p) or is_video(p)]
-        if not paths:
+        add = [p for p in paths if is_image(p) or is_video(p)]
+        if not add:
             return
+        merged = list(self.inputs)
+        for p in add:
+            if p not in merged:
+                merged.append(p)
+        self._apply_inputs(merged, rebuild_thumbs=True)
+
+    def _on_thumbs_changed(self, paths):
+        self._apply_inputs(list(paths), rebuild_thumbs=False)
+
+    def _apply_inputs(self, paths, rebuild_thumbs):
         self.inputs = paths
-        self.drop.set_files(paths)
-        self._update_meta()
-        self._set_default_output()
+        has = len(paths) > 0
+        if rebuild_thumbs:
+            self.thumbs.set_files(paths)
+        self.thumbs.setVisible(has)
+        self.drop.set_compact(has)
+        if has:
+            self._update_meta()
+            self._set_default_output()
+            self._load_first_frame()
+        else:
+            self.meta.setText("첨부된 파일 없음")
+            self._first_frame = None
+            self._last_preview_rgb = None
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("영상/이미지를 첨부하면\n여기에서 미리 볼 수 있어요")
+            self.preview_caption.setText("")
+            self.out_edit.clear()
+
+    def _load_first_frame(self):
+        self._first_frame = None
+        self._last_preview_rgb = None
+        p = self.inputs[0]
+        try:
+            if is_video(p):
+                cap = cv2.VideoCapture(p)
+                ok, fr = cap.read()
+                cap.release()
+                self._first_frame = fr if ok else None
+            else:
+                data = _imread_unicode(p)
+                if data is not None:
+                    if data.ndim == 2:
+                        self._first_frame = cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
+                    elif data.shape[2] == 4:
+                        self._first_frame = cv2.cvtColor(data, cv2.COLOR_BGRA2BGR)
+                    else:
+                        self._first_frame = data[:, :, :3].copy()
+        except Exception:
+            self._first_frame = None
+
+        if self._first_frame is not None:
+            # 원본 썸네일 즉시 표시 후, 설정 반영 미리보기 예약
+            small = self._preview_source()
+            self._show_preview_rgb(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+            self._preview_timer.start(120)
+        else:
+            self.preview.setText("첫 프레임을 불러오지 못했습니다")
 
     def _update_meta(self):
         imgs = [p for p in self.inputs if is_image(p)]
@@ -271,7 +516,6 @@ class MainWindow(QWidget):
         if imgs:
             parts.append(f"이미지 {len(imgs)}")
         head = " · ".join(parts) if parts else "없음"
-
         if len(self.inputs) == 1 and vids:
             try:
                 cap = cv2.VideoCapture(self.inputs[0])
@@ -297,13 +541,11 @@ class MainWindow(QWidget):
             out = base + "_cloaked.mp4" if is_video(p) else base + "_cloaked" + ext
             self.out_edit.setText(out)
             self.out_label.setText("저장 경로 (파일)")
-            self.out_edit.setPlaceholderText("저장할 위치/파일명…")
         else:
             folder = os.path.join(
                 os.path.dirname(os.path.abspath(self.inputs[0])), "cloaked_output")
             self.out_edit.setText(folder)
             self.out_label.setText("저장 폴더 (여러 파일 일괄)")
-            self.out_edit.setPlaceholderText("결과를 저장할 폴더…")
 
     def pick_output(self):
         if len(self.inputs) > 1:
@@ -393,26 +635,10 @@ class MainWindow(QWidget):
 
     def _set_running(self, running: bool):
         self._running = running
-        if running:
-            self.run_btn.setText("취소")
-            self.run_btn.setObjectName("Ghost")
-        else:
-            self.run_btn.setText("실행")
-            self.run_btn.setObjectName("Primary")
-        self.run_btn.setStyleSheet("")
-        self.run_btn.style().unpolish(self.run_btn)
-        self.run_btn.style().polish(self.run_btn)
+        self._style_run_button(running)
 
     def on_preview(self, rgb):
-        try:
-            h, w, ch = rgb.shape
-            img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-            pix = QPixmap.fromImage(img.copy())
-            self.preview.setPixmap(pix.scaled(
-                self.preview.width(), self.preview.height(),
-                Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        except Exception:
-            pass
+        self._show_preview_rgb(rgb)
 
     def on_done(self, msg):
         self._set_running(False)
@@ -449,6 +675,50 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    # ------------------------------------------------------------ 자동 업데이트
+    def _start_update_check(self):
+        self._checker = _CheckThread()
+        self._checker.result.connect(self._on_update_result)
+        self._checker.start()
+
+    def _on_update_result(self, info):
+        if not info or not info.get("setup"):
+            return
+        self._update_info = info
+        self.banner_label.setText(
+            f"새 버전 v{info['version']} 이(가) 있습니다. 지금 업데이트할 수 있어요.")
+        self.banner.setVisible(True)
+
+    def _do_update(self):
+        info = getattr(self, "_update_info", None)
+        if not info or not info.get("setup"):
+            return
+        self.btn_update.setEnabled(False)
+        self.btn_later.setEnabled(False)
+        self.banner_pb.setVisible(True)
+        self.banner_pb.setValue(0)
+        self.banner_label.setText("업데이트 다운로드 중…")
+        self._downloader = _DownloadThread(info["setup"])
+        self._downloader.progress.connect(lambda f: self.banner_pb.setValue(int(f * 100)))
+        self._downloader.done.connect(self._on_update_downloaded)
+        self._downloader.failed.connect(self._on_update_failed)
+        self._downloader.start()
+
+    def _on_update_downloaded(self, path):
+        self.banner_label.setText("설치기를 실행합니다. 앱이 종료됩니다…")
+        try:
+            os.startfile(path)  # noqa
+        except Exception:
+            import subprocess
+            subprocess.Popen([path])
+        QTimer.singleShot(600, self.close)
+
+    def _on_update_failed(self, err):
+        self.banner_pb.setVisible(False)
+        self.btn_update.setEnabled(True)
+        self.btn_later.setEnabled(True)
+        self.banner_label.setText(f"업데이트 실패: {err}. 릴리스 페이지에서 수동 설치하세요.")
+
     # ------------------------------------------------------------------ misc
     def _maybe_first_run(self):
         if not self.settings.value("tutorial_seen", False, type=bool):
@@ -457,10 +727,7 @@ class MainWindow(QWidget):
     def show_tutorial(self):
         dlg = TutorialDialog(self)
         dlg.exec()
-        if dlg.dont_show_again():
-            self.settings.setValue("tutorial_seen", True)
-        else:
-            self.settings.setValue("tutorial_seen", True)
+        self.settings.setValue("tutorial_seen", True)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -484,10 +751,7 @@ class _Root(QWidget):
         r = QRectF(self.rect())
         path = QPainterPath()
         path.addRoundedRect(r, 14, 14)
-        # 아크릴이 적용되면 유리처럼 비치고, 실패해도 충분히 어둡게(대비 확보)
         p.fillPath(path, QColor(12, 13, 18, 232))
-        # 상단 미세 광택
-        from PySide6.QtGui import QLinearGradient
         g = QLinearGradient(0, 0, 0, 120)
         g.setColorAt(0.0, QColor(255, 255, 255, 16))
         g.setColorAt(1.0, QColor(255, 255, 255, 0))

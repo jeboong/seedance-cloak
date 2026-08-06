@@ -9,6 +9,17 @@ build/_preview.png
 *.zip
 *.exe
 
+# 미디어(대용량, 테스트/샘플) — 데모 gif 는 docs/ 에서 예외 허용
+*.mov
+*.mp4
+*.mkv
+*.avi
+*.webm
+*.wmv
+*.flv
+REP_0350_A0007C009*
+!docs/**/*.gif
+
 # PyInstaller
 *.spec
 
