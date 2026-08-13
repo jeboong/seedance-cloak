@@ -338,6 +338,7 @@ class MediaWorker(QThread):
                 writer.write(data)
 
         idx = 0
+        pipe_broke = False
         try:
             while True:
                 if self._abort:
@@ -352,9 +353,9 @@ class MediaWorker(QThread):
                 try:
                     emit(frame)
                 except (BrokenPipeError, OSError):
-                    err = _ffmpeg_error(stderr_file)
-                    _cleanup(cap, proc, writer, stderr_file, kill=True)
-                    return False, f"FFmpeg 파이프 오류:\n{err}"
+                    # ffmpeg 가 먼저 종료됨(정상 종료일 수 있음) → 아래서 반환코드로 판정
+                    pipe_broke = True
+                    break
                 idx += 1
                 if idx % 12 == 0:
                     self.preview.emit(cv2.cvtColor(
@@ -362,7 +363,7 @@ class MediaWorker(QThread):
                 if total_est and idx % 3 == 0:
                     on_progress(min(0.95, idx / total_est))
 
-            if will_pad and idx < target_frames:
+            if will_pad and not pipe_broke and idx < target_frames:
                 self.status.emit(f"검은화면으로 {cfg.pad_seconds:.0f}초까지 채우는 중...")
                 black = np.zeros((H, W, 3), np.uint8)
                 while idx < target_frames:
@@ -372,9 +373,8 @@ class MediaWorker(QThread):
                     try:
                         emit(black)
                     except (BrokenPipeError, OSError):
-                        err = _ffmpeg_error(stderr_file)
-                        _cleanup(cap, proc, writer, stderr_file, kill=True)
-                        return False, f"FFmpeg 파이프 오류:\n{err}"
+                        pipe_broke = True
+                        break
                     idx += 1
                     if target_frames and idx % 3 == 0:
                         on_progress(min(0.95, idx / target_frames))
@@ -386,13 +386,12 @@ class MediaWorker(QThread):
                 except Exception:
                     pass
                 rc = proc.wait()
-                if rc != 0:
-                    err = _ffmpeg_error(stderr_file)
-                    if stderr_file:
-                        stderr_file.close()
-                    return False, f"FFmpeg 인코딩 실패(코드 {rc}):\n{err}"
+                err = _ffmpeg_error(stderr_file)
                 if stderr_file:
                     stderr_file.close()
+                # rc==0 이면 파이프가 끊겼어도(ffmpeg 조기 정상종료) 성공으로 간주
+                if rc != 0:
+                    return False, f"FFmpeg 인코딩 실패(코드 {rc}):\n{err}"
             else:
                 writer.release()
 
@@ -454,7 +453,9 @@ def _ffmpeg_error(stderr_file) -> str:
         data = stderr_file.read()
         if isinstance(data, bytes):
             data = data.decode("utf-8", "ignore")
-        lines = [l for l in data.splitlines() if l.strip()]
+        lines = [l for l in data.splitlines() if l.strip()
+                 and not l.lstrip().startswith("frame=")
+                 and "bitrate=" not in l]
         return "\n".join(lines[-6:]) or "(추가 정보 없음)"
     except Exception:
         return "(로그 읽기 실패)"

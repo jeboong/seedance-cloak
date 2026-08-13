@@ -226,7 +226,7 @@ def build_render_cmd(
     """
     preset = QUALITY_PRESETS.get(preset_key, QUALITY_PRESETS[DEFAULT_PRESET])
 
-    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "-"]
 
@@ -241,12 +241,11 @@ def build_render_cmd(
     cmd += list(preset.args)
 
     if use_audio:
-        cmd += ["-c:a", "aac", "-b:a", "192k"]
-        if pad_to_seconds:
-            # 오디오를 무음으로 무한 패딩 → 영상(패딩 포함) 길이에 맞춰 잘림
-            cmd += ["-af", "apad", "-shortest"]
-        else:
-            cmd += ["-shortest"]
+        # 오디오 길이가 영상과 달라도(예: 슬로우모션은 영상만 늘어남) 항상
+        # 무음 패딩(apad) 후 영상 길이에 맞춤(-shortest).
+        # → 출력 길이 = 우리가 보낸 프레임 수. (-shortest 단독은 짧은 오디오에
+        #   맞춰 영상을 잘라버려 렌더가 조기 종료되는 문제가 있었음)
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-af", "apad", "-shortest"]
 
     ext = os.path.splitext(out_path)[1].lower()
     if not simple and ext in (".mp4", ".mov", ".m4v"):
